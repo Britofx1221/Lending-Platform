@@ -11,8 +11,15 @@
 (define-constant ERR-REQUESTED-LOAN-NOT-FOUND (err u103))
 (define-constant ERR-INVALID-MONETARY-AMOUNT (err u104))
 (define-constant ERR-LOAN-NOT-ELIGIBLE-LIQUIDATION (err u105))
+(define-constant ERR-INVALID-PROTOCOL-PARAMETER (err u106))
 
 ;; Protocol parameters
+;; Define reasonable bounds for protocol parameters
+(define-constant MAX-COLLATERAL-RATIO-BPS u30000)   ;; 300% maximum
+(define-constant MIN-COLLATERAL-RATIO-BPS u10000)   ;; 100% minimum
+(define-constant MAX-INTEREST-RATE-BPS u5000)       ;; 50% maximum annual rate
+(define-constant MIN-INTEREST-RATE-BPS u100)        ;; 1% minimum annual rate
+
 (define-data-var minimum-required-collateral-ratio-bps uint u15000)  ;; 150% in basis points
 (define-data-var protocol-interest-rate-yearly-bps uint u500)        ;; 5% annual rate in basis points
 (define-data-var minimum-liquidation-threshold-bps uint u13000)      ;; 130% in basis points
@@ -42,10 +49,19 @@
 ;; Global protocol state
 (define-data-var protocol-total-loan-count uint u1)
 
-;; Administrative functions
+;; Administrative functions with enhanced validation
 (define-public (update-protocol-collateral-requirement (new-minimum-collateral-ratio-bps uint))
     (begin
+        ;; Validate caller is contract owner
         (asserts! (is-eq tx-sender contract-owner) ERR-CALLER-NOT-AUTHORIZED)
+        
+        ;; Validate new collateral ratio is within acceptable bounds
+        (asserts! (and 
+            (>= new-minimum-collateral-ratio-bps MIN-COLLATERAL-RATIO-BPS)
+            (<= new-minimum-collateral-ratio-bps MAX-COLLATERAL-RATIO-BPS)
+        ) ERR-INVALID-PROTOCOL-PARAMETER)
+        
+        ;; Update protocol parameter
         (var-set minimum-required-collateral-ratio-bps new-minimum-collateral-ratio-bps)
         (ok true)
     )
@@ -53,7 +69,16 @@
 
 (define-public (update-protocol-interest-rate (new-yearly-interest-rate-bps uint))
     (begin
+        ;; Validate caller is contract owner
         (asserts! (is-eq tx-sender contract-owner) ERR-CALLER-NOT-AUTHORIZED)
+        
+        ;; Validate new interest rate is within acceptable bounds
+        (asserts! (and 
+            (>= new-yearly-interest-rate-bps MIN-INTEREST-RATE-BPS)
+            (<= new-yearly-interest-rate-bps MAX-INTEREST-RATE-BPS)
+        ) ERR-INVALID-PROTOCOL-PARAMETER)
+        
+        ;; Update protocol parameter
         (var-set protocol-interest-rate-yearly-bps new-yearly-interest-rate-bps)
         (ok true)
     )
@@ -107,11 +132,22 @@
         (borrower-account-state (default-to
             { current-lending-pool-balance: u0, current-borrowed-principal: u0, current-locked-collateral: u0 }
             (map-get? protocol-user-account-state borrower-address)))
-        (calculated-collateral-ratio-bps (/ (* offered-collateral-ustx u10000) requested-principal-ustx))
+        (calculated-collateral-ratio-bps 
+            (if (> requested-principal-ustx u0)
+                (/ (* offered-collateral-ustx u10000) requested-principal-ustx)
+                u0
+            )
+        )
     )
     (begin
+        ;; Validate loan amounts
+        (asserts! (> requested-principal-ustx u0) ERR-INVALID-MONETARY-AMOUNT)
+        (asserts! (> offered-collateral-ustx u0) ERR-INVALID-MONETARY-AMOUNT)
+        
+        ;; Validate collateralization
         (asserts! (>= calculated-collateral-ratio-bps (var-get minimum-required-collateral-ratio-bps))
             ERR-COLLATERAL-BELOW-MINIMUM)
+        
         (try! (stx-transfer? offered-collateral-ustx borrower-address (as-contract tx-sender)))
         
         ;; Register new loan
@@ -150,11 +186,12 @@
         (repayer-address tx-sender)
         (loan-record (unwrap! (map-get? protocol-loan-registry { protocol-loan-id: protocol-loan-id })
             ERR-REQUESTED-LOAN-NOT-FOUND))
-        (repayer-account-state (default-to
-            { current-lending-pool-balance: u0, current-borrowed-principal: u0, current-locked-collateral: u0 }
-            (map-get? protocol-user-account-state repayer-address)))
     )
     (begin
+        ;; Validate protocol-loan-id
+        (asserts! (< protocol-loan-id (var-get protocol-total-loan-count)) ERR-REQUESTED-LOAN-NOT-FOUND)
+        
+        ;; Validate loan state and ownership
         (asserts! (is-eq (get borrower-address loan-record) repayer-address) ERR-CALLER-NOT-AUTHORIZED)
         (asserts! (is-eq (get current-loan-state loan-record) "active") ERR-REQUESTED-LOAN-NOT-FOUND)
         
@@ -182,12 +219,22 @@
             ;; Update account state
             (map-set protocol-user-account-state
                 repayer-address
-                (merge repayer-account-state {
-                    current-borrowed-principal: (- (get current-borrowed-principal repayer-account-state)
-                        (get loan-principal-amount loan-record)),
-                    current-locked-collateral: (- (get current-locked-collateral repayer-account-state)
-                        (get deposited-collateral-amount loan-record))
-                })
+                (merge (default-to
+                    { current-lending-pool-balance: u0, current-borrowed-principal: u0, current-locked-collateral: u0 }
+                    (map-get? protocol-user-account-state repayer-address))
+                    {
+                        current-borrowed-principal: (- (get current-borrowed-principal 
+                            (default-to
+                                { current-lending-pool-balance: u0, current-borrowed-principal: u0, current-locked-collateral: u0 }
+                                (map-get? protocol-user-account-state repayer-address)))
+                            (get loan-principal-amount loan-record)),
+                        current-locked-collateral: (- (get current-locked-collateral 
+                            (default-to
+                                { current-lending-pool-balance: u0, current-borrowed-principal: u0, current-locked-collateral: u0 }
+                                (map-get? protocol-user-account-state repayer-address)))
+                            (get deposited-collateral-amount loan-record))
+                    }
+                )
             )
             (ok true)
         )
@@ -200,12 +247,16 @@
         (liquidator-address tx-sender)
         (loan-record (unwrap! (map-get? protocol-loan-registry { protocol-loan-id: protocol-loan-id })
             ERR-REQUESTED-LOAN-NOT-FOUND))
-        (current-collateralization-ratio-bps (/ (* (get deposited-collateral-amount loan-record) u10000)
-            (get loan-principal-amount loan-record)))
     )
     (begin
+        ;; Validate protocol-loan-id
+        (asserts! (< protocol-loan-id (var-get protocol-total-loan-count)) ERR-REQUESTED-LOAN-NOT-FOUND)
+        
+        ;; Additional validation checks
         (asserts! (is-eq (get current-loan-state loan-record) "active") ERR-REQUESTED-LOAN-NOT-FOUND)
-        (asserts! (< current-collateralization-ratio-bps (var-get minimum-liquidation-threshold-bps))
+        (asserts! (< (/ (* (get deposited-collateral-amount loan-record) u10000)
+                        (get loan-principal-amount loan-record))
+                    (var-get minimum-liquidation-threshold-bps))
             ERR-LOAN-NOT-ELIGIBLE-LIQUIDATION)
         
         ;; Transfer collateral to liquidator
@@ -218,22 +269,26 @@
         )
         
         ;; Update borrower's account state
-        (let (
-            (borrower-account-state (default-to
+        (map-set protocol-user-account-state
+            (get borrower-address loan-record)
+            (merge (default-to
                 { current-lending-pool-balance: u0, current-borrowed-principal: u0, current-locked-collateral: u0 }
-                (map-get? protocol-user-account-state (get borrower-address loan-record))))
-        )
-            (map-set protocol-user-account-state
-                (get borrower-address loan-record)
-                (merge borrower-account-state {
-                    current-borrowed-principal: (- (get current-borrowed-principal borrower-account-state)
+                (map-get? protocol-user-account-state (get borrower-address loan-record)))
+                {
+                    current-borrowed-principal: (- (get current-borrowed-principal 
+                        (default-to
+                            { current-lending-pool-balance: u0, current-borrowed-principal: u0, current-locked-collateral: u0 }
+                            (map-get? protocol-user-account-state (get borrower-address loan-record))))
                         (get loan-principal-amount loan-record)),
-                    current-locked-collateral: (- (get current-locked-collateral borrower-account-state)
+                    current-locked-collateral: (- (get current-locked-collateral 
+                        (default-to
+                            { current-lending-pool-balance: u0, current-borrowed-principal: u0, current-locked-collateral: u0 }
+                            (map-get? protocol-user-account-state (get borrower-address loan-record))))
                         (get deposited-collateral-amount loan-record))
-                })
+                }
             )
-            (ok true)
         )
+        (ok true)
     ))
 )
 
@@ -252,4 +307,12 @@
 
 (define-read-only (get-protocol-collateral-requirement)
     (var-get minimum-required-collateral-ratio-bps)
+)
+
+(define-read-only (get-protocol-liquidation-threshold)
+    (var-get minimum-liquidation-threshold-bps)
+)
+
+(define-read-only (get-total-loan-count)
+    (var-get protocol-total-loan-count)
 )
