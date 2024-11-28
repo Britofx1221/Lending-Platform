@@ -1,6 +1,9 @@
 ;; Debt Market Smart Contract
 ;; Enables peer-to-peer lending and borrowing with collateral-backed loans
 
+;; Define contract owner - the address that deployed the contract
+(define-constant contract-owner tx-sender)
+
 ;; Error codes
 (define-constant ERR-CALLER-NOT-AUTHORIZED (err u100))
 (define-constant ERR-WALLET-BALANCE-TOO-LOW (err u101))
